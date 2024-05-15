@@ -13,6 +13,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+const volatile struct {
+    int backend_count;
+    struct in_addr vip;
+} l4_lb_cfg = {};
+
 /* This is the data record stored in the map */
 struct backend {
     __be32 ip;
@@ -23,8 +28,8 @@ struct backend {
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, int);
-    __type(value, struct backend);
-    __uint(max_entries, 1024);
+    __type(value, struct backend[]);
+    __uint(max_entries, 1);
 } backend_map SEC(".maps");
 
 struct connection {
@@ -37,7 +42,7 @@ struct connection {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct connection);
-    __type(value, struct in_addr);
+    __type(value, int);
     __uint(max_entries, 1024);
 } connections_map SEC(".maps");
 
@@ -147,16 +152,37 @@ int l4_lb(struct xdp_md *ctx) {
         .src_port = src_port,
     };
 
-    struct backend *load;
-    struct in_addr *backend_ip = bpf_map_lookup_elem(&connections_map, &conn);
+    struct backend *backend;
+    int *backend_idx = bpf_map_lookup_elem(&connections_map, &conn);
 
-    if (backend_ip == NULL) {
+    int key = 0;
+    struct backend **backends = bpf_map_lookup_elem(&backend_map, &key);
+
+    if (!backend_idx) {
         // conn not assigned to a backend
-    } else {
-        load = bpf_map_lookup_elem(&backend_map, &backend_ip->s_addr);
-    }
+        __u32 min_load = UINT32_MAX;
 
-    __sync_fetch_and_add(&load->num_packets, 1);
+        for (int i = 0; i < l4_lb_cfg.backend_count; i++) {
+            __u64 load = backends[i]->num_packets / backends[i]->num_flows;
+            if (load < min_load) {
+                min_load = load;
+                backend = backends[i];
+            }
+        }
+
+        if (!backend) {
+            return XDP_ABORTED;
+        }
+
+        __sync_fetch_and_add(&backend->num_packets, 1);
+        __sync_fetch_and_add(&backend->num_flows, 1);
+    } else {
+        backend = bpf_map_lookup_elem(&backend_map, backend_idx);
+        if (!backend) {
+            return XDP_ABORTED;
+        }
+        __sync_fetch_and_add(&backend->num_packets, 1);
+    }
 
     // encapsulate packet in new ip packet
 
