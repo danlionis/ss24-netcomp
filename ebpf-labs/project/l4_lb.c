@@ -158,6 +158,7 @@ int main(int argc, const char **argv) {
         return 1;
     }
 
+    log_info("Setting rodata");
     skel->rodata->l4_lb_cfg.vip = vip;
     skel->rodata->l4_lb_cfg.backend_count = conf->backends_count;
 
@@ -177,11 +178,8 @@ int main(int argc, const char **argv) {
     // Access data
     printf("VIP: %s\n", conf->vip);
     printf("Backends %ld:\n", conf->backends_count);
-    struct in_addr *backends;
-    backends = malloc(sizeof(struct in_addr) * conf->backends_count);
 
-    size_t key = 0;
-    for (size_t i = 0; i < conf->backends_count; i++) {
+    for (int i = 0; i < conf->backends_count; i++) {
         log_info("Loading IP %s", conf->backends[i].ip);
 
         // Convert the IP to an integer
@@ -192,10 +190,8 @@ int main(int argc, const char **argv) {
             continue;
         }
 
-        backends[i] = addr;
+        bpf_map_update_elem(backend_map, &i, &addr, 0);
     }
-
-    bpf_map_update_elem(backend_map, &key, backends, 0);
 
     struct sigaction action;
     memset(&action, 0, sizeof(action));

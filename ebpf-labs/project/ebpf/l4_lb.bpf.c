@@ -1,6 +1,7 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
+
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
 #include <linux/if_ether.h>
@@ -12,9 +13,10 @@
 #include <linux/udp.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 const volatile struct {
-    int backend_count;
+    __u8 backend_count;
     struct in_addr vip;
 } l4_lb_cfg = {};
 
@@ -27,9 +29,9 @@ struct backend {
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, int);
-    __type(value, struct backend[]);
-    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct backend);
+    __uint(max_entries, 1024);
 } backend_map SEC(".maps");
 
 struct connection {
@@ -109,10 +111,20 @@ static __always_inline int parse_udphdr(void *data, void *data_end, __u16 *nh_of
     return len;
 }
 
+__u64 backend_load(int i) {
+    struct backend *tmp = bpf_map_lookup_elem(&backend_map, &i);
+    if (!tmp) {
+        return UINT32_MAX;
+    }
+    return tmp->num_packets / tmp->num_flows;
+}
+
 SEC("xdp")
 int l4_lb(struct xdp_md *ctx) {
-    void *data_end = (void *)(long)ctx->data_end;
-    void *data = (void *)(long)ctx->data;
+    void *data_end;
+    void *data;
+    data_end = (void *)(long)ctx->data_end;
+    data = (void *)(long)ctx->data;
 
     __u16 nf_off = 0;
     struct ethhdr *eth;
@@ -153,45 +165,74 @@ int l4_lb(struct xdp_md *ctx) {
     };
 
     struct backend *backend;
-    int *backend_idx = bpf_map_lookup_elem(&connections_map, &conn);
+    int *backend_idx_ptr = bpf_map_lookup_elem(&connections_map, &conn);
+    int new_conn = 0;
+    int backend_idx = -1;
 
-    int key = 0;
-    struct backend **backends = bpf_map_lookup_elem(&backend_map, &key);
+    if (backend_idx_ptr) {
+        backend_idx = *backend_idx_ptr;
+    }
 
-    if (!backend_idx) {
+    if (backend_idx == -1) {
+        new_conn = 1;
         // conn not assigned to a backend
         __u32 min_load = UINT32_MAX;
 
         for (int i = 0; i < l4_lb_cfg.backend_count; i++) {
-            __u64 load = backends[i]->num_packets / backends[i]->num_flows;
+            __u64 load = backend_load(i);
             if (load < min_load) {
                 min_load = load;
-                backend = backends[i];
+                backend_idx = i;
             }
         }
+    }
 
-        if (!backend) {
-            return XDP_ABORTED;
-        }
+    backend = bpf_map_lookup_elem(&backend_map, &backend_idx);
+    if (!backend) {
+        return XDP_ABORTED;
+    }
 
-        __sync_fetch_and_add(&backend->num_packets, 1);
+    __sync_fetch_and_add(&backend->num_packets, 1);
+    if (new_conn) {
         __sync_fetch_and_add(&backend->num_flows, 1);
-    } else {
-        backend = bpf_map_lookup_elem(&backend_map, backend_idx);
-        if (!backend) {
-            return XDP_ABORTED;
-        }
-        __sync_fetch_and_add(&backend->num_packets, 1);
     }
 
     // encapsulate packet in new ip packet
 
     // adjust head size
-    __u8 ihl = iphdr->ihl * 4;
-    if (bpf_xdp_adjust_head(ctx, ihl) != 0) {
+    __u16 ihl = iphdr->ihl * 4;
+    if (bpf_xdp_adjust_head(ctx, 0 - ihl) != 0) {
         bpf_printk("could not adjust head");
         return XDP_DROP;
     }
+
+    data_end = (void *)(long)ctx->data_end;
+    data = (void *)(long)ctx->data;
+
+    eth = data + sizeof(struct ethhdr);
+    if ((void *)eth + sizeof(struct ethhdr) > data_end)
+        return XDP_ABORTED;
+    __builtin_memcpy(data, eth, sizeof(*eth));
+
+    struct iphdr *outer_iphdr;
+    outer_iphdr = (void *)eth + sizeof(struct iphdr);
+    iphdr = (void *)outer_iphdr + sizeof(struct iphdr);
+    if ((void *)outer_iphdr + sizeof(struct iphdr) > data_end ||
+        (void *)iphdr + sizeof(struct iphdr) > data_end)
+        return XDP_ABORTED;
+    __builtin_memcpy(outer_iphdr, iphdr, sizeof(*outer_iphdr));
+
+    outer_iphdr->daddr = backend->ip;
+    outer_iphdr->protocol = IPPROTO_IPIP;
+
+    __u32 csum;
+    csum = bpf_csum_diff(&iphdr->daddr, sizeof(iphdr->daddr), &outer_iphdr->daddr,
+                         sizeof(outer_iphdr->daddr), iphdr->check);
+    csum = bpf_csum_diff((void *)&iphdr->protocol, sizeof(iphdr->protocol),
+                         (void *)&outer_iphdr->protocol, sizeof(outer_iphdr->protocol), csum);
+    outer_iphdr->check = ~csum;
+
+    return XDP_TX;
 
 drop:
     return XDP_DROP;

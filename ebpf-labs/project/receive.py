@@ -4,7 +4,7 @@
 import sys
 import os
 
-from scapy.all import sniff, get_if_list, Ether, get_if_hwaddr, IP, Raw, Dot1Q
+from scapy.all import sniff, Ether, get_if_hwaddr, IP
 import argparse
 
 def isNotOutgoing(my_mac):
