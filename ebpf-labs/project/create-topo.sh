@@ -93,27 +93,11 @@ for (( i=0; i<$num_ips; i++ )); do
     IFS='.' read -r octet1 octet2 octet3 octet4 <<< "$ip"
 
     # Create the gateway address
-    gateway="$octet1.$octet2.$octet3.24"
+    gateway="$octet1.$octet2.$octet3.0"
     sudo ifconfig veth${port} ${gateway}/24 up
     
 
-    # sudo ip netns exec ns${i} ${DIR}/l4_lb -i veth${port}_
-
-    # sudo ethtool --offload veth${port} rx off tx off > /dev/null 2>&1
-    # sudo ip netns exec ns${port} ethtool --offload veth${port}_ rx off tx off > /dev/null 2>&1
-
-    # for (( j=0; j<$num_ips; j++ )); do
-    #     nested_elem=$(echo "$yaml" | shyaml get-value backends.$j)
-    #
-    #     nested_ip=$(echo "$nested_elem" | shyaml get-value "ip")
-    #
-    #     # check if the port is the same as the current port
-    #     if [ "$j" == "$i" ]; then
-    #         continue
-    #     fi
-    #
-    #     sudo ip netns exec ns${port} ip route add ${nested_ip}/32 via ${gw}
-    # done
+    # sudo ip netns exec ns${port} python3 ./receive.py -i veth${port}_
 done
 
 echo -e "${COLOR_GREEN} Topology created successfully ${COLOR_OFF}"
