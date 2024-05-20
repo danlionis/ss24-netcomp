@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# enable forwarding to that the namespaces can communicate
+sudo sysctl net.ipv4.ip_forward=1
+
 COLOR_RED='\033[0;31m'
 COLOR_GREEN='\033[0;32m'
 COLOR_YELLOW='\033[0;33m'
@@ -36,6 +39,7 @@ fi
 
 # Get the number of elements in the ips list
 num_ips=$(echo "$yaml" | shyaml get-length backends)
+num_ips=$((num_ips + 1))
 
 # function cleanup: is invoked each time script exit (with or without errors)
 function cleanup {
@@ -76,26 +80,30 @@ set +x
 # Create two network namespaces and veth pairs
 create_veth ${num_ips}
 
+vip=$(echo "$yaml" | shyaml get-value vip)
+IFS='.' read -r octet1 octet2 octet3 octet4 <<< "$vip"
+vip_gateway="$octet1.$octet2.$octet3.0"
+sudo ip netns exec ns1 ifconfig veth1_ ${vip}/24
+sudo ifconfig veth1 ${vip_gateway}/24 up
 
 # Loop through the ips in the YAML file
-for (( i=0; i<$num_ips; i++ )); do
+for (( i=0; i<$num_ips-1; i++ )); do
     elem=$(echo "$yaml" | shyaml get-value backends.$i)
 
     ip=$(echo "$elem" | shyaml get-value "ip")
-    port=$((i + 1))
+    port=$((i+2))
 
     echo -e "${COLOR_GREEN} IP: $ip"
 
     sudo ip netns exec ns${port} ifconfig veth${port}_ ${ip}/24
     # sudo ifconfig veth${port} ${gw}/24
     
-    # Split the IP into its components
     IFS='.' read -r octet1 octet2 octet3 octet4 <<< "$ip"
-
-    # Create the gateway address
     gateway="$octet1.$octet2.$octet3.0"
     sudo ifconfig veth${port} ${gateway}/24 up
     
+    sudo ip netns exec ns1 ip route add ${ip}/32 via ${vip_gateway}
+    sudo ip netns exec ns${port} ip route add ${vip}/32 via ${gateway}
 
     # sudo ip netns exec ns${port} python3 ./receive.py -i veth${port}_
 done
