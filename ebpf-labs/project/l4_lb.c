@@ -34,23 +34,29 @@ static const char *const usages[] = {
 };
 
 // Define the structure to hold the YAML data
-struct backend {
+struct backend_yaml {
     char *ip;
+};
+
+struct backend {
+    __be32 ip;
+    __u64 num_flows;
+    __u64 num_packets;
 };
 
 struct config {
     char *vip;
-    struct backend *backends;
+    struct backend_yaml *backends;
     size_t backends_count;
 };
 
 static const cyaml_schema_field_t backend_field_schema[] = {
-    CYAML_FIELD_STRING_PTR("ip", CYAML_FLAG_POINTER, struct backend, ip, 0, CYAML_UNLIMITED),
+    CYAML_FIELD_STRING_PTR("ip", CYAML_FLAG_POINTER, struct backend_yaml, ip, 0, CYAML_UNLIMITED),
     CYAML_FIELD_END,
 };
 
 static const cyaml_schema_value_t backend_schema = {
-    CYAML_VALUE_MAPPING(CYAML_FLAG_DEFAULT, struct backend, backend_field_schema),
+    CYAML_VALUE_MAPPING(CYAML_FLAG_DEFAULT, struct backend_yaml, backend_field_schema),
 };
 
 /* CYAML mapping schema fields array for the top level mapping. */
@@ -183,14 +189,16 @@ int main(int argc, const char **argv) {
         log_info("Loading IP %s", conf->backends[i].ip);
 
         // Convert the IP to an integer
-        struct in_addr addr;
-        int ret = inet_pton(AF_INET, conf->backends[i].ip, &addr);
+        struct backend be;
+        be.num_flows = 0;
+        be.num_packets = 0;
+        int ret = inet_pton(AF_INET, conf->backends[i].ip, &be.ip);
         if (ret != 1) {
             log_error("Failed to convert IP %s to integer", conf->backends[i].ip);
             continue;
         }
 
-        bpf_map_update_elem(backend_map, &i, &addr, 0);
+        bpf_map_update_elem(backend_map, &i, &be, 0);
     }
 
     struct sigaction action;
@@ -219,6 +227,9 @@ int main(int argc, const char **argv) {
     }
 
     log_info("Successfully attached!");
+    while (1) {
+        sleep(10000);
+    }
 
 cleanup:
     cleanup_ifaces();

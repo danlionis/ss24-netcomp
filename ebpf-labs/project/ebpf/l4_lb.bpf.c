@@ -128,6 +128,8 @@ __u64 backend_load(int i) {
     if (!tmp) {
         return UINT32_MAX;
     }
+    bpf_printk("backend= %d flows= %d packets= %d load= %d", i, tmp->num_flows, tmp->num_packets,
+               tmp->num_packets / tmp->num_flows);
     return tmp->num_packets / tmp->num_flows;
 }
 
@@ -182,6 +184,7 @@ int l4_lb(struct xdp_md *ctx) {
     int backend_idx = -1;
 
     if (backend_idx_ptr) {
+        bpf_printk("known flow");
         backend_idx = *backend_idx_ptr;
     }
 
@@ -199,6 +202,8 @@ int l4_lb(struct xdp_md *ctx) {
         }
     }
 
+    bpf_printk("choosing backend %d", backend_idx);
+
     backend = bpf_map_lookup_elem(&backend_map, &backend_idx);
     if (!backend) {
         return XDP_ABORTED;
@@ -207,6 +212,7 @@ int l4_lb(struct xdp_md *ctx) {
     __sync_fetch_and_add(&backend->num_packets, 1);
     if (new_flow) {
         __sync_fetch_and_add(&backend->num_flows, 1);
+        bpf_map_update_elem(&connections_map, &conn, &backend_idx, BPF_ANY);
     }
 
     // encapsulate packet in new ip packet
