@@ -49,33 +49,13 @@ struct {
     __uint(max_entries, 1024);
 } connections_map SEC(".maps");
 
-__attribute__((__always_inline__)) static inline __u16 csum_fold_helper(__u64 csum) {
-    int i;
-#pragma unroll
-    for (i = 0; i < 4; i++) {
-        if (csum >> 16)
-            csum = (csum & 0xffff) + (csum >> 16);
-    }
-    return ~csum;
-}
-
-__attribute__((__always_inline__)) static inline void ipv4_csum(void *data_start, int data_size,
-                                                                __u64 *csum) {
-    *csum = bpf_csum_diff(0, 0, data_start, data_size, *csum);
-    *csum = csum_fold_helper(*csum);
-}
-
-__attribute__((__always_inline__)) static inline void
-ipv4_l4_csum(void *data_start, __u32 data_size, __u64 *csum, struct iphdr *iph) {
-    __u32 tmp = 0;
-    *csum = bpf_csum_diff(0, 0, &iph->saddr, sizeof(__be32), *csum);
-    *csum = bpf_csum_diff(0, 0, &iph->daddr, sizeof(__be32), *csum);
-    tmp = __builtin_bswap32((__u32)(iph->protocol));
-    *csum = bpf_csum_diff(0, 0, &tmp, sizeof(__u32), *csum);
-    tmp = __builtin_bswap32((__u32)(data_size));
-    *csum = bpf_csum_diff(0, 0, &tmp, sizeof(__u32), *csum);
-    *csum = bpf_csum_diff(0, 0, data_start, data_size, *csum);
-    *csum = csum_fold_helper(*csum);
+__attribute__((__always_inline__)) static inline void ipv4_csum(struct iphdr *iph) {
+    uint16_t *next = (uint16_t *)iph;
+    uint32_t csum;
+#pragma clang loop unroll(full)
+    for (int i = 0; i < sizeof(*iph) >> 1; i++)
+        csum += *next++;
+    iph->check = ~((csum & 0xffff) + (csum >> 16));
 }
 
 static __always_inline int parse_ethhdr(void *data, void *data_end, __u16 *nh_off,
@@ -229,46 +209,50 @@ int l4_lb(struct xdp_md *ctx) {
 
     // encapsulate packet in new ip packet
 
-    // adjust head size
-    __u16 ihl = iphdr->ihl * 4;
-    if (bpf_xdp_adjust_head(ctx, 0 - ihl) != 0) {
+    if (bpf_xdp_adjust_head(ctx, 0 - (int)sizeof(struct iphdr)) != 0) {
         bpf_printk("could not adjust head");
         return XDP_DROP;
     }
 
+    struct ethhdr *old_eth;
+
     data_end = (void *)(long)ctx->data_end;
     data = (void *)(long)ctx->data;
 
-    struct ethhdr *old_eth = data + sizeof(struct iphdr);
+    eth = data;
+    old_eth = data + sizeof(struct iphdr);
     if ((void *)old_eth + sizeof(struct ethhdr) > data_end)
         return XDP_ABORTED;
-    __builtin_memcpy(data, old_eth, sizeof(*old_eth));
+
+    // switch dest and source of ethernet packet
+    memcpy(eth->h_source, old_eth->h_dest, sizeof(eth->h_source));
+    memcpy(eth->h_dest, old_eth->h_source, sizeof(eth->h_dest));
+    eth->h_proto = old_eth->h_proto;
 
     struct iphdr *outer_iphdr;
-    outer_iphdr = (void *)eth + sizeof(struct ethhdr);
-    iphdr = (void *)outer_iphdr + sizeof(struct iphdr);
+    outer_iphdr = data + sizeof(*eth);
+    iphdr = (void *)outer_iphdr + sizeof(*outer_iphdr);
+
     if ((void *)eth + sizeof(struct ethhdr) > data_end ||
         (void *)outer_iphdr + sizeof(struct iphdr) > data_end ||
         (void *)iphdr + sizeof(struct iphdr) > data_end)
         return XDP_ABORTED;
 
-    unsigned char tmp[ETH_ALEN];
-    __builtin_memcpy(tmp, eth->h_source, ETH_ALEN);
-    __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
-    __builtin_memcpy(eth->h_dest, tmp, ETH_ALEN);
-
-    __builtin_memcpy(outer_iphdr, iphdr, sizeof(*outer_iphdr));
-
-    outer_iphdr->daddr = backend->ip;
+    outer_iphdr->version = 4;
+    outer_iphdr->ihl = iphdr->ihl;
+    outer_iphdr->frag_off = 0;
     outer_iphdr->protocol = IPPROTO_IPIP;
-    outer_iphdr->tot_len = bpf_htons(bpf_ntohs(outer_iphdr->tot_len) + outer_iphdr->ihl * 4);
+    outer_iphdr->check = 0;
+    outer_iphdr->tos = 0;
+    outer_iphdr->tot_len = bpf_htons(bpf_ntohs(iphdr->tot_len) + sizeof(*iphdr));
+    outer_iphdr->daddr = backend->ip;
+    outer_iphdr->saddr = iphdr->saddr;
+    outer_iphdr->ttl = iphdr->ttl;
 
-    __u32 csum;
-    csum = bpf_csum_diff(&iphdr->daddr, sizeof(iphdr->daddr), &outer_iphdr->daddr,
-                         sizeof(outer_iphdr->daddr), iphdr->check);
-    csum = bpf_csum_diff((void *)&iphdr->protocol, sizeof(iphdr->protocol),
-                         (void *)&outer_iphdr->protocol, sizeof(outer_iphdr->protocol), csum);
-    outer_iphdr->check = ~csum;
+    iphdr->ttl -= 1;
+
+    ipv4_csum(outer_iphdr);
+    ipv4_csum(iphdr);
 
     bpf_printk("TX packet");
     return XDP_TX;
