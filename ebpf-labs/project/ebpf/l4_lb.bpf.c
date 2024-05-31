@@ -11,6 +11,7 @@
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -47,6 +48,35 @@ struct {
     __type(value, int);
     __uint(max_entries, 1024);
 } connections_map SEC(".maps");
+
+__attribute__((__always_inline__)) static inline __u16 csum_fold_helper(__u64 csum) {
+    int i;
+#pragma unroll
+    for (i = 0; i < 4; i++) {
+        if (csum >> 16)
+            csum = (csum & 0xffff) + (csum >> 16);
+    }
+    return ~csum;
+}
+
+__attribute__((__always_inline__)) static inline void ipv4_csum(void *data_start, int data_size,
+                                                                __u64 *csum) {
+    *csum = bpf_csum_diff(0, 0, data_start, data_size, *csum);
+    *csum = csum_fold_helper(*csum);
+}
+
+__attribute__((__always_inline__)) static inline void
+ipv4_l4_csum(void *data_start, __u32 data_size, __u64 *csum, struct iphdr *iph) {
+    __u32 tmp = 0;
+    *csum = bpf_csum_diff(0, 0, &iph->saddr, sizeof(__be32), *csum);
+    *csum = bpf_csum_diff(0, 0, &iph->daddr, sizeof(__be32), *csum);
+    tmp = __builtin_bswap32((__u32)(iph->protocol));
+    *csum = bpf_csum_diff(0, 0, &tmp, sizeof(__u32), *csum);
+    tmp = __builtin_bswap32((__u32)(data_size));
+    *csum = bpf_csum_diff(0, 0, &tmp, sizeof(__u32), *csum);
+    *csum = bpf_csum_diff(0, 0, data_start, data_size, *csum);
+    *csum = csum_fold_helper(*csum);
+}
 
 static __always_inline int parse_ethhdr(void *data, void *data_end, __u16 *nh_off,
                                         struct ethhdr **ethhdr) {
@@ -166,7 +196,7 @@ int l4_lb(struct xdp_md *ctx) {
 
     struct backend *backend;
     int *backend_idx_ptr = bpf_map_lookup_elem(&connections_map, &conn);
-    int new_conn = 0;
+    int new_flow = 0;
     int backend_idx = -1;
 
     if (backend_idx_ptr) {
@@ -174,7 +204,7 @@ int l4_lb(struct xdp_md *ctx) {
     }
 
     if (backend_idx == -1) {
-        new_conn = 1;
+        new_flow = 1;
         // conn not assigned to a backend
         __u32 min_load = UINT32_MAX;
 
@@ -193,7 +223,7 @@ int l4_lb(struct xdp_md *ctx) {
     }
 
     __sync_fetch_and_add(&backend->num_packets, 1);
-    if (new_conn) {
+    if (new_flow) {
         __sync_fetch_and_add(&backend->num_flows, 1);
     }
 
@@ -209,21 +239,29 @@ int l4_lb(struct xdp_md *ctx) {
     data_end = (void *)(long)ctx->data_end;
     data = (void *)(long)ctx->data;
 
-    eth = data + sizeof(struct ethhdr);
-    if ((void *)eth + sizeof(struct ethhdr) > data_end)
+    struct ethhdr *old_eth = data + sizeof(struct iphdr);
+    if ((void *)old_eth + sizeof(struct ethhdr) > data_end)
         return XDP_ABORTED;
-    __builtin_memcpy(data, eth, sizeof(*eth));
+    __builtin_memcpy(data, old_eth, sizeof(*old_eth));
 
     struct iphdr *outer_iphdr;
-    outer_iphdr = (void *)eth + sizeof(struct iphdr);
+    outer_iphdr = (void *)eth + sizeof(struct ethhdr);
     iphdr = (void *)outer_iphdr + sizeof(struct iphdr);
-    if ((void *)outer_iphdr + sizeof(struct iphdr) > data_end ||
+    if ((void *)eth + sizeof(struct ethhdr) > data_end ||
+        (void *)outer_iphdr + sizeof(struct iphdr) > data_end ||
         (void *)iphdr + sizeof(struct iphdr) > data_end)
         return XDP_ABORTED;
+
+    unsigned char tmp[ETH_ALEN];
+    __builtin_memcpy(tmp, eth->h_source, ETH_ALEN);
+    __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
+    __builtin_memcpy(eth->h_dest, tmp, ETH_ALEN);
+
     __builtin_memcpy(outer_iphdr, iphdr, sizeof(*outer_iphdr));
 
     outer_iphdr->daddr = backend->ip;
     outer_iphdr->protocol = IPPROTO_IPIP;
+    outer_iphdr->tot_len = bpf_htons(bpf_ntohs(outer_iphdr->tot_len) + outer_iphdr->ihl * 4);
 
     __u32 csum;
     csum = bpf_csum_diff(&iphdr->daddr, sizeof(iphdr->daddr), &outer_iphdr->daddr,
@@ -232,6 +270,7 @@ int l4_lb(struct xdp_md *ctx) {
                          (void *)&outer_iphdr->protocol, sizeof(outer_iphdr->protocol), csum);
     outer_iphdr->check = ~csum;
 
+    bpf_printk("TX packet");
     return XDP_TX;
 
 drop:
