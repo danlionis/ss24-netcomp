@@ -51,10 +51,12 @@ struct {
 
 __attribute__((__always_inline__)) static inline void ipv4_csum(struct iphdr *iph) {
     uint16_t *next = (uint16_t *)iph;
-    uint32_t csum;
-#pragma clang loop unroll(full)
-    for (int i = 0; i < sizeof(*iph) >> 1; i++)
-        csum += *next++;
+    uint32_t csum = 0;
+    iph->check = 0;
+    for (int i = 0; i < sizeof(struct iphdr) >> 1; i++) {
+        csum += *next;
+        next++;
+    }
     iph->check = ~((csum & 0xffff) + (csum >> 16));
 }
 

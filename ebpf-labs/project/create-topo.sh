@@ -2,6 +2,8 @@
 
 # enable forwarding to that the namespaces can communicate
 sudo sysctl net.ipv4.ip_forward=1
+sudo sysctl net.ipv4.conf.all.rp_filter=0
+sudo sysctl net.ipv4.conf.default.rp_filter=0
 
 COLOR_RED='\033[0;31m'
 COLOR_GREEN='\033[0;32m'
@@ -85,6 +87,7 @@ IFS='.' read -r octet1 octet2 octet3 octet4 <<< "$vip"
 vip_gateway="$octet1.$octet2.$octet3.0"
 sudo ip netns exec ns1 ifconfig veth1_ ${vip}/24
 sudo ifconfig veth1 ${vip_gateway}/24 up
+sudo sysctl net.ipv4.conf.veth1.rp_filter=0
 
 # Loop through the ips in the YAML file
 for (( i=0; i<$num_ips-1; i++ )); do
@@ -105,6 +108,8 @@ for (( i=0; i<$num_ips-1; i++ )); do
     sudo ip netns exec ns1 ip route add ${ip}/32 via ${vip_gateway}
     sudo ip netns exec ns${port} ip route add ${vip}/32 via ${gateway}
 
+
+    sudo sysctl net.ipv4.conf.veth${port}.rp_filter=0
     # sudo ip netns exec ns${port} python3 ./receive.py -i veth${port}_
 done
 
